@@ -9,6 +9,8 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::app_config::AppType;
 use crate::error::AppError;
+use crate::services::omo::STANDARD as OMO_STANDARD;
+use crate::services::OmoService;
 use crate::store::AppState;
 
 const TEMPLATE_TYPE_OFFICIAL_SUBSCRIPTION: &str = "official_subscription";
@@ -99,6 +101,11 @@ pub struct TrayAppSection {
 /// Auto 菜单项后缀
 pub const AUTO_SUFFIX: &str = "auto";
 pub const TRAY_ID: &str = "cc-switch";
+
+/// OMO 托盘菜单前缀和 ID
+const OMO_TRAY_PREFIX: &str = "omo_";
+const OMO_TRAY_EMPTY_ID: &str = "omo_empty";
+const OMO_TRAY_DISABLE_ID: &str = "omo_disable";
 
 pub const TRAY_SECTIONS: [TrayAppSection; 3] = [
     TrayAppSection {
@@ -597,6 +604,79 @@ pub fn create_tray_menu(
         menu_builder = menu_builder.separator();
     }
 
+    // ── OMO 配置分区 ────────────────────────────────────
+    if visible_apps.is_visible(&AppType::OpenCode) {
+        let omo_providers = app_state.db.get_all_providers("opencode")?;
+        // 只显示 category=omo 的 provider
+        let omo_only: indexmap::IndexMap<String, crate::provider::Provider> = omo_providers
+            .into_iter()
+            .filter(|(_, p)| p.category.as_deref() == Some("omo"))
+            .collect();
+
+        if omo_only.is_empty() {
+            let label = format!("OMO {}", tray_texts.no_providers_label);
+            let empty_item =
+                MenuItem::with_id(app, OMO_TRAY_EMPTY_ID, &label, false, None::<&str>)
+                    .map_err(|e| AppError::Message(format!("创建OMO空提示失败: {e}")))?;
+            menu_builder = menu_builder.item(&empty_item);
+        } else {
+            let current_omo = app_state.db.get_current_omo_provider("opencode", "omo")?;
+            let current_omo_id = current_omo.as_ref().map(|p| p.id.as_str()).unwrap_or("");
+            let current_omo_name = current_omo.as_ref().map(|p| p.name.as_str());
+
+            let submenu_label = match current_omo_name {
+                Some(name) => format!("OMO · {}", name),
+                None => "OMO".to_string(),
+            };
+
+            let mut submenu_builder =
+                SubmenuBuilder::with_id(app, "submenu_omo", &submenu_label);
+
+            for (id, provider) in sort_providers(&omo_only) {
+                let is_current = current_omo_id == id.as_str();
+                let item = CheckMenuItem::with_id(
+                    app,
+                    format!("{}{}", OMO_TRAY_PREFIX, id),
+                    &provider.name,
+                    true,
+                    is_current,
+                    None::<&str>,
+                )
+                .map_err(|e| AppError::Message(format!("创建OMO菜单项失败: {e}")))?;
+                submenu_builder = submenu_builder.item(&item);
+            }
+
+            // 添加「禁用 OMO」选项
+            let none_selected = current_omo_id.is_empty();
+            let disable_label = match tray_texts.show_main {
+                // 用语言判断：英文环境
+                "Open main window" => "Disable OMO",
+                // 日文环境
+                "メインウィンドウを開く" => "OMO を無効化",
+                // 中文环境
+                _ => "禁用 OMO",
+            };
+            submenu_builder = submenu_builder.separator();
+            let disable_item = CheckMenuItem::with_id(
+                app,
+                OMO_TRAY_DISABLE_ID,
+                disable_label,
+                true,
+                none_selected,
+                None::<&str>,
+            )
+            .map_err(|e| AppError::Message(format!("创建OMO禁用菜单失败: {e}")))?;
+            submenu_builder = submenu_builder.item(&disable_item);
+
+            let submenu = submenu_builder
+                .build()
+                .map_err(|e| AppError::Message(format!("构建OMO子菜单失败: {e}")))?;
+            menu_builder = menu_builder.item(&submenu);
+        }
+
+        menu_builder = menu_builder.separator();
+    }
+
     let lightweight_item = CheckMenuItem::with_id(
         app,
         "lightweight_mode",
@@ -695,6 +775,100 @@ pub fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
     }
 }
 
+/// 处理 OMO 配置托盘点击
+fn handle_omo_click(app: &tauri::AppHandle, provider_id: &str) -> Result<(), AppError> {
+    if let Some(app_state) = app.try_state::<AppState>() {
+        // 设置当前 OMO provider 并写入配置文件
+        app_state
+            .db
+            .set_omo_provider_current("opencode", provider_id, "omo")?;
+        OmoService::write_config_to_file(&app_state, &OMO_STANDARD)?;
+
+        // 刷新托盘菜单
+        if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
+            if let Some(tray) = app.tray_by_id("main") {
+                let _ = tray.set_menu(Some(new_menu));
+            }
+        }
+
+        // 通知前端
+        let event_data = serde_json::json!({
+            "appType": "opencode",
+            "providerId": provider_id,
+            "category": "omo"
+        });
+        if let Err(e) = app.emit("provider-switched", event_data) {
+            log::error!("发射 provider-switched 事件失败: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// 处理 OMO 禁用点击
+fn handle_omo_disable(app: &tauri::AppHandle) -> Result<(), AppError> {
+    if let Some(app_state) = app.try_state::<AppState>() {
+        // 清除所有 OMO provider 的 current 状态
+        let providers = app_state.db.get_all_providers("opencode")?;
+        for (id, p) in &providers {
+            if p.category.as_deref() == Some("omo") {
+                app_state
+                    .db
+                    .clear_omo_provider_current("opencode", id, "omo")?;
+            }
+        }
+        // 删除 OMO 配置文件
+        OmoService::delete_config_file(&OMO_STANDARD)?;
+
+        // 刷新托盘菜单
+        if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
+            if let Some(tray) = app.tray_by_id("main") {
+                let _ = tray.set_menu(Some(new_menu));
+            }
+        }
+
+        // 通知前端
+        let event_data = serde_json::json!({
+            "appType": "opencode",
+            "category": "omo",
+            "disabled": true
+        });
+        if let Err(e) = app.emit("provider-switched", event_data) {
+            log::error!("发射 provider-switched 事件失败: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// 处理 OMO 托盘事件，返回 true 表示已处理
+fn handle_omo_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool {
+    // 处理禁用
+    if event_id == OMO_TRAY_DISABLE_ID {
+        log::info!("禁用 OMO 配置");
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = handle_omo_disable(&app_handle) {
+                log::error!("禁用 OMO 失败: {e}");
+            }
+        });
+        return true;
+    }
+
+    // 处理切换
+    if let Some(provider_id) = event_id.strip_prefix(OMO_TRAY_PREFIX) {
+        log::info!("切换 OMO 配置: {provider_id}");
+        let app_handle = app.clone();
+        let provider_id = provider_id.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = handle_omo_click(&app_handle, &provider_id) {
+                log::error!("切换 OMO 配置失败: {e}");
+            }
+        });
+        return true;
+    }
+
+    false
+}
+
 /// 处理托盘菜单事件
 pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
     log::info!("处理托盘菜单事件: {event_id}");
@@ -743,6 +917,9 @@ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
         }
         _ => {
             if handle_provider_tray_event(app, event_id) {
+                return;
+            }
+            if handle_omo_tray_event(app, event_id) {
                 return;
             }
             log::warn!("未处理的菜单事件: {event_id}");
