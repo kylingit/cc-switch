@@ -209,8 +209,12 @@ pub fn add_plugin(plugin_name: &str) -> Result<(), AppError> {
 
     let plugins = config.get_mut("plugin").and_then(|v| v.as_array_mut());
 
+    let mut changed = false;
+
     match plugins {
         Some(arr) => {
+            let len_before = arr.len();
+
             // Mutual exclusion: standard OMO and OMO Slim cannot coexist as plugins
             if matches_any_plugin_prefix(&normalized_plugin_name, &STANDARD_OMO_PLUGIN_PREFIXES) {
                 arr.retain(|v| {
@@ -233,35 +237,56 @@ pub fn add_plugin(plugin_name: &str) -> Result<(), AppError> {
                 });
             }
 
+            if arr.len() != len_before {
+                changed = true;
+            }
+
             let already_exists = arr
                 .iter()
                 .any(|v| v.as_str() == Some(normalized_plugin_name.as_str()));
             if !already_exists {
                 arr.push(Value::String(normalized_plugin_name));
+                changed = true;
             }
         }
         None => {
             config["plugin"] = json!([normalized_plugin_name]);
+            changed = true;
         }
     }
 
-    write_opencode_config(&config)
+    if changed {
+        write_opencode_config(&config)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn remove_plugins_by_prefixes(prefixes: &[&str]) -> Result<(), AppError> {
     let mut config = read_opencode_config()?;
 
+    let mut changed = false;
+
     if let Some(arr) = config.get_mut("plugin").and_then(|v| v.as_array_mut()) {
+        let len_before = arr.len();
         arr.retain(|v| {
             v.as_str()
                 .map(|s| !matches_any_plugin_prefix(s, prefixes))
                 .unwrap_or(true)
         });
 
+        if arr.len() != len_before {
+            changed = true;
+        }
+
         if arr.is_empty() {
             config.as_object_mut().map(|obj| obj.remove("plugin"));
         }
     }
 
-    write_opencode_config(&config)
+    if changed {
+        write_opencode_config(&config)
+    } else {
+        Ok(())
+    }
 }
