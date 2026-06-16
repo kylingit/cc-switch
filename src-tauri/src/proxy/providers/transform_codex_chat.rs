@@ -278,6 +278,7 @@ pub fn responses_to_chat_completions_with_reasoning(
     if let Some(input) = body.get("input") {
         append_responses_input_as_chat_messages(input, &mut messages, &tool_context)?;
     }
+    let messages = collapse_consecutive_assistant_messages(messages);
     let messages = collapse_system_messages_to_head(messages);
     result["messages"] = json!(messages);
 
@@ -496,6 +497,95 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "max" => Some("max"),
             _ => None,
         },
+    }
+}
+
+/// 合并相邻的 assistant 消息，避免「连续两条 assistant」破坏 Anthropic 配对约束。
+///
+/// 背景：Codex 的 Responses input 常出现
+///   `message(assistant, text)` → `function_call` → `function_call_output`
+/// 这样的序列。转换时 `message` item 先产出一条纯文本 assistant，随后
+/// `function_call_output` 触发 `flush_pending_tool_calls` 又产出一条带 tool_calls
+/// 的 assistant —— 于是出现连续两条 assistant 消息。
+///
+/// Anthropic（含 Bedrock）不允许连续 assistant，且要求每个 tool_result 紧邻在
+/// 含对应 tool_use 的 assistant 之后。连续 assistant 会让下游转换打断
+/// tool_use ↔ tool_result 的紧邻关系，触发：
+///   `unexpected tool_use_id ... must have a corresponding tool_use block in
+///    the previous message`
+///
+/// 合并规则（把后一条并入前一条，保持顺序）：
+///   - content：两条都是非空字符串 → 换行拼接；否则取非空的一方
+///   - reasoning_content：复用 `append_reasoning_content` 的换行拼接语义
+///   - tool_calls：数组按顺序拼接（前一条在前）
+fn collapse_consecutive_assistant_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for msg in messages {
+        let is_assistant = msg.get("role").and_then(|v| v.as_str()) == Some("assistant");
+        let prev_is_assistant = out
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            == Some("assistant");
+
+        if is_assistant && prev_is_assistant {
+            // 把当前 assistant 并入 out 的最后一条 assistant
+            if let (Some(prev), Some(cur)) = (
+                out.last_mut().and_then(|m| m.as_object_mut()),
+                msg.as_object(),
+            ) {
+                merge_assistant_into(prev, cur);
+                continue;
+            }
+        }
+
+        out.push(msg);
+    }
+
+    out
+}
+
+/// 把 `src` assistant 消息的字段并入 `dst`（dst 为前一条，src 为后一条）。
+fn merge_assistant_into(
+    dst: &mut serde_json::Map<String, Value>,
+    src: &serde_json::Map<String, Value>,
+) {
+    // content：换行拼接两侧的非空字符串
+    let dst_text = dst.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let src_text = src.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let merged_content = match (dst_text.trim().is_empty(), src_text.trim().is_empty()) {
+        (false, false) => Some(format!("{dst_text}\n{src_text}")),
+        (false, true) => Some(dst_text.to_string()),
+        (true, false) => Some(src_text.to_string()),
+        (true, true) => None,
+    };
+    match merged_content {
+        Some(text) => {
+            dst.insert("content".to_string(), Value::String(text));
+        }
+        None => {
+            // 两侧都无文本：保留 null（Chat Completions 允许 content=null + tool_calls）
+            dst.insert("content".to_string(), Value::Null);
+        }
+    }
+
+    // reasoning_content：复用统一的换行拼接语义
+    if let Some(src_reasoning) = src.get("reasoning_content").and_then(|v| v.as_str()) {
+        append_reasoning_content(dst, src_reasoning);
+    }
+
+    // tool_calls：按顺序拼接（前一条在前，后一条在后）
+    let src_calls = src.get("tool_calls").and_then(|v| v.as_array()).cloned();
+    if let Some(mut src_calls) = src_calls {
+        if !src_calls.is_empty() {
+            match dst.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                Some(dst_calls) => dst_calls.append(&mut src_calls),
+                None => {
+                    dst.insert("tool_calls".to_string(), Value::Array(src_calls));
+                }
+            }
+        }
     }
 }
 
@@ -3114,5 +3204,106 @@ mod tests {
             "tools should be present from tool_search_output"
         );
         assert_eq!(result["tools"][0]["function"]["name"], "search_docs");
+    }
+
+    #[test]
+    fn responses_request_to_chat_merges_text_assistant_before_tool_call() {
+        // 真实 bug 场景：message(assistant text) → function_call → function_call_output
+        // 转换后不应产生连续两条 assistant，文本与 tool_calls 应合并到同一条。
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Let me read the file."
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Readme content"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // 不应有连续 assistant
+        for pair in messages.windows(2) {
+            assert!(
+                !(pair[0]["role"] == "assistant" && pair[1]["role"] == "assistant"),
+                "must not contain consecutive assistant messages: {messages:?}"
+            );
+        }
+        // 合并后的 assistant：文本 + tool_calls 同条
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "Let me read the file.");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        // tool_result 紧邻其后
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_request_to_chat_merges_multiple_tool_calls_with_text() {
+        // 并行多 tool_call + 前置文本：合并后一条 assistant 带全部 tool_calls。
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Reading two files."
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"a\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_b",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"b\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "A"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_b",
+                    "output": "B"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        for pair in messages.windows(2) {
+            assert!(
+                !(pair[0]["role"] == "assistant" && pair[1]["role"] == "assistant"),
+                "must not contain consecutive assistant messages: {messages:?}"
+            );
+        }
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "Reading two files.");
+        let calls = messages[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2, "both tool_calls merged into one assistant");
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[1]["id"], "call_b");
+        // 两条 tool 结果紧随其后
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "tool");
     }
 }

@@ -515,11 +515,14 @@ impl RequestForwarder {
                     });
                 }
                 Err(e) => {
-                    // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
+                    // 检测是否需要触发整流器
+                    // 扩展到 Codex 类型：当 Codex 通过 cc-switch 转发到 Anthropic 上游时，
+                    // 也可能遇到 thinking signature 错误，需要 rectifier 介入。
+                    // rectifier 内部有错误消息匹配守卫，非 Anthropic 错误不会误触发。
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
                         provider_type,
-                        ProviderType::Claude | ProviderType::ClaudeAuth
+                        ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::Codex
                     );
                     let mut signature_rectifier_non_retryable_client_error = false;
 
